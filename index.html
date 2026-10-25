@@ -6,7 +6,7 @@
 <meta name="robots" content="noindex">
 <title>Live QR Scanner</title>
 <!--
-  Live QR Scanner  (v1.0) – one file, works for any web app.
+  Live QR Scanner  (v1.1) – one file, works for any web app.
 
   HOW AN APP USES IT
     Open:   <this page>?return=<URL-encoded link back to the app>
@@ -53,6 +53,15 @@
   .center { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 24px; text-align: center; gap: 10px; }
   .center p { margin: 0; max-width: 340px; line-height: 1.5; color: #ddd; }
   canvas, input[type=file] { display: none; }
+  /* camera permission guide */
+  .guide { width: 100%; max-width: 360px; background: rgba(255,255,255,.08); border: 1px solid rgba(255,255,255,.18); border-radius: 18px; padding: 18px; text-align: left; }
+  .guide h2 { margin: 0 0 6px; font-size: 18px; }
+  .guide p { margin: 0 0 10px; color: #ddd; line-height: 1.5; max-width: none; }
+  .guide ol { margin: 0; padding-left: 22px; color: #ddd; line-height: 1.55; }
+  .guide li { margin: 3px 0; }
+  .guide b { color: #fff; }
+  .guide .note { margin: 10px 0 0; font-size: 13px; color: #aaa; }
+  .guide .btn { width: 100%; margin-top: 14px; flex: none; }
 </style>
 </head>
 <body>
@@ -66,7 +75,7 @@
 <div class="view" id="view">
   <video id="video" playsinline muted></video>
   <div class="frame" id="frame" hidden></div>
-  <div class="center" id="center"><p id="center-msg">Starting the camera…</p></div>
+  <div class="center" id="center"><p id="center-msg">Starting the camera…</p><div class="guide" id="guide" hidden></div></div>
   <div class="msg" id="msg" hidden></div>
 </div>
 
@@ -101,7 +110,16 @@
   var stream = null, raf = 0, busy = false, track = null, torchOn = false;
   var canFull = false;   // set below
 
-  function center(text) { $('center').hidden = !text; $('center-msg').textContent = text || ''; }
+  function center(text) {
+    $('center').hidden = !text; $('center-msg').hidden = false; $('center-msg').textContent = text || ''; $('guide').hidden = true;
+  }
+  /** A card with steps instead of the plain message (html is fixed text from this file only). */
+  function guide(html) {
+    $('center').hidden = false; $('center-msg').hidden = true;
+    var g = $('guide'); g.innerHTML = html; g.hidden = false;
+    var b = g.querySelector('[data-go]'); if (b) b.addEventListener('click', function () { goFull(); openCamera(); });
+    var r = g.querySelector('[data-reload]'); if (r) r.addEventListener('click', function () { location.reload(); });
+  }
   function say(text, bad) { var m = $('msg'); m.hidden = !text; m.textContent = text || ''; m.classList.toggle('bad', !!bad); }
 
   /** Any QR text → back to the app, which decides what it means. */
@@ -114,13 +132,66 @@
     location.replace(ret + (ret.indexOf('?') === -1 ? '?' : '&') + 'qr=' + encodeURIComponent(text));
   }
 
+  // ================= camera permission: 1) allowed → start  2) not decided → short tip, then ask  3) blocked → steps
+  var ua = navigator.userAgent || '';
+  var PHONE = /iPhone|iPad|iPod/.test(ua) || (/Macintosh/.test(ua) && navigator.maxTouchPoints > 1) ? 'ios'
+            : /Android/.test(ua) ? 'android' : 'other';
+  var TIP_KEY = 'lqs_tip_seen', permStatus = null, blocked = false;
+  function tipSeen() { try { return localStorage.getItem(TIP_KEY) === '1'; } catch (e) { return false; } }
+  function markTipSeen() { try { localStorage.setItem(TIP_KEY, '1'); } catch (e) { /* ignore */ } }
+
+  /** 'granted' | 'prompt' | 'denied' | 'unknown' (browsers without the check). */
+  function cameraPermission() {
+    if (!navigator.permissions || !navigator.permissions.query) return Promise.resolve('unknown');
+    return navigator.permissions.query({ name: 'camera' }).then(function (st) {
+      if (!permStatus) {           // tell us when the person changes the setting → start by itself
+        permStatus = st;
+        try { st.onchange = function () { if (st.state !== 'denied' && blocked && !busy) { blocked = false; openCamera(); } }; } catch (e) { /* ignore */ }
+      }
+      return st.state;
+    }).catch(function () { return 'unknown'; });
+  }
+
+  var TIP = {
+    android: '<h2>Allow the camera</h2><p>Chrome will ask to use the camera. Tap <b>Allow while visiting the site</b> (not “Only this time”) so it doesn’t ask again.</p>',
+    ios: '<h2>Allow the camera</h2><p>Safari will ask to use the camera. Tap <b>Allow</b>.</p>' +
+         '<p class="note">So Safari stops asking every time: tap <b>aA</b> in the address bar → <b>Website Settings</b> → <b>Camera</b> → <b>Allow</b>.</p>',
+    other: '<h2>Allow the camera</h2><p>Your browser will ask to use the camera. Choose <b>Allow</b> and, if offered, <b>Remember</b>.</p>'
+  };
+  var STEPS = {
+    android: '<h2>Camera is blocked</h2><p>Turn it on once for this page:</p><ol>' +
+      '<li>Tap the icon at the <b>left of the address bar</b>.</li><li>Tap <b>Permissions</b> (or <b>Site settings</b>).</li>' +
+      '<li>Set <b>Camera</b> to <b>Allow</b>.</li></ol><p class="note">The camera starts by itself when you come back. If it doesn’t, tap Reload.</p>',
+    ios: '<h2>Camera is blocked</h2><p>Turn it on once for this page:</p><ol>' +
+      '<li>Tap <b>aA</b> at the left of the address bar.</li><li>Tap <b>Website Settings</b>.</li>' +
+      '<li>Set <b>Camera</b> to <b>Allow</b>, then tap <b>Done</b>.</li><li>Tap <b>Reload</b> below.</li></ol>' +
+      '<p class="note">For all websites: Settings app → Apps → Safari → Camera → Allow.</p>',
+    other: '<h2>Camera is blocked</h2><p>Allow the camera for this page in your browser’s site settings (usually the icon at the left of the address bar), then tap Reload.</p>'
+  };
+
   function start() {
     $('retry').hidden = true;
     if (!ret) { center('Please open the scanner from your app.'); $('photo').hidden = true; return; }
-    if (!window.jsQR) { center('The QR reader could not be loaded. Please check the internet connection.'); $('retry').hidden = false; return; }
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
       center('This browser cannot use the camera here. Use the photo button, or open the link in Safari (iPhone) or Chrome (Android).'); return;
     }
+    center('Starting the camera…');
+    cameraPermission().then(function (state) {
+      if (state === 'granted') return openCamera();                         // 1) already allowed
+      if (state === 'denied') return showBlocked();                          // 3) blocked
+      if (tipSeen()) return openCamera();                                    // 2) tip shown before → just ask
+      guide(TIP[PHONE] + '<button class="btn primary" type="button" data-go>Start camera</button>');
+    });
+  }
+  function showBlocked() {
+    blocked = true; stop();
+    guide(STEPS[PHONE] + '<button class="btn primary" type="button" data-reload>Reload</button>');
+  }
+
+  function openCamera() {
+    $('retry').hidden = true;
+    markTipSeen();
+    if (!window.jsQR) { center('The QR reader could not be loaded. Please check the internet connection.'); $('retry').hidden = false; return; }
     center('Starting the camera…');
     navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false })
       .then(function (s) {
@@ -139,9 +210,8 @@
       })
       .catch(function (e) {
         stop();
-        var denied = e && (e.name === 'NotAllowedError' || e.name === 'SecurityError');
-        center(denied ? 'Camera access was blocked. Allow the camera for this page in your browser settings and tap Try again – or use the photo button.'
-                      : 'The camera could not be started (' + (e && e.name || 'error') + '). You can use the photo button instead.');
+        if (e && (e.name === 'NotAllowedError' || e.name === 'SecurityError')) return showBlocked();
+        center('The camera could not be started (' + (e && e.name || 'error') + '). You can use the photo button instead.');
         $('retry').hidden = false;
       });
   }
@@ -247,7 +317,7 @@
   $('view').addEventListener('click', goFull);
   ['photo', 'torch', 'retry'].forEach(function (id) { $(id).addEventListener('click', goFull); });
 
-  $('retry').addEventListener('click', start);
+  $('retry').addEventListener('click', openCamera);
   $('torch').addEventListener('click', function () {
     if (!track) return;
     torchOn = !torchOn;
@@ -256,7 +326,13 @@
   });
   // camera off while the page is hidden (phone locked, photo gallery open…), back on when shown again
   document.addEventListener('visibilitychange', function () {
-    if (document.hidden) stop(); else if (!busy && !stream && ret && $('retry').hidden) start();
+    if (document.hidden) { stop(); return; }
+    if (busy || stream || !ret) return;
+    if (blocked) {                    // back from the settings → start if it is allowed now
+      cameraPermission().then(function (st) { if (st === 'granted' && blocked) { blocked = false; openCamera(); } });
+      return;
+    }
+    if ($('retry').hidden && $('guide').hidden) openCamera();
   });
   window.addEventListener('pagehide', stop);
   document.addEventListener('fullscreenchange', function () { if (document.fullscreenElement && stream && !busy) say('Point the camera at a QR code.'); });
