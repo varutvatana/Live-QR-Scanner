@@ -38,6 +38,7 @@
   .frame.found { border-color: #7BE0A9; }
   .msg { position: absolute; left: 16px; right: 16px; bottom: 18px; text-align: center; font-weight: 600; font-size: 16px; line-height: 1.4;
          text-shadow: 0 1px 3px rgba(0,0,0,.6); }
+  .msg { white-space: pre-line; }
   .msg.bad { color: #FFC9C3; }
   footer { display: flex; align-items: center; gap: 10px;
            padding: 12px 16px calc(14px + env(safe-area-inset-bottom)); background: rgba(0,0,0,.55); position: relative; z-index: 2; }
@@ -62,7 +63,7 @@
   <strong>Live QR Scanner</strong>
 </header>
 
-<div class="view">
+<div class="view" id="view">
   <video id="video" playsinline muted></video>
   <div class="frame" id="frame" hidden></div>
   <div class="center" id="center"><p id="center-msg">Starting the camera…</p></div>
@@ -98,6 +99,7 @@
   $('back').href = ret || 'javascript:history.back()';
 
   var stream = null, raf = 0, busy = false, track = null, torchOn = false;
+  var canFull = false;   // set below
 
   function center(text) { $('center').hidden = !text; $('center-msg').textContent = text || ''; }
   function say(text, bad) { var m = $('msg'); m.hidden = !text; m.textContent = text || ''; m.classList.toggle('bad', !!bad); }
@@ -128,7 +130,7 @@
       })
       .then(function () {
         center(''); $('frame').hidden = false;
-        say('Point the camera at a QR code.');
+        say(canFull && !document.fullscreenElement ? 'Point the camera at a QR code.\nTap the screen for full screen.' : 'Point the camera at a QR code.');
         try {   // flashlight button where the phone supports it (mostly Android)
           var caps = track && track.getCapabilities ? track.getCapabilities() : {};
           $('torch').hidden = !caps.torch;
@@ -144,25 +146,68 @@
       });
   }
 
+  // ---- fast reading without freezing the picture
+  // 1) the phone's own QR reader (BarcodeDetector – Android Chrome) when it has one,
+  // 2) otherwise jsQR in a background worker, 3) otherwise jsQR here (slowest).
+  // Reads about 8 times a second, never more than one read at a time, so the video stays smooth.
+  var JSQR_URL = 'https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js';
+  var READ_EVERY_MS = 120, SIDE = 480;
+  var engine = null, detector = null, worker = null, pending = false, timer = 0;
+
+  function pickEngine() {
+    if (engine) return Promise.resolve(engine);
+    var tryNative = ('BarcodeDetector' in window) && window.BarcodeDetector.getSupportedFormats
+      ? window.BarcodeDetector.getSupportedFormats().then(function (f) {
+          if (f.indexOf('qr_code') === -1) return false;
+          detector = new window.BarcodeDetector({ formats: ['qr_code'] }); return true;
+        }).catch(function () { return false; })
+      : Promise.resolve(false);
+    return tryNative.then(function (ok) {
+      if (ok) return (engine = 'native');
+      try {
+        var src = 'importScripts("' + JSQR_URL + '");onmessage=function(e){var d=e.data,r=null;' +
+          'try{r=jsQR(new Uint8ClampedArray(d.b),d.w,d.h,{inversionAttempts:"dontInvert"})}catch(x){}postMessage(r&&r.data||"")}';
+        worker = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
+        worker.onmessage = function (e) { pending = false; if (e.data && !busy) deliver(e.data); };
+        worker.onerror = function () { try { worker.terminate(); } catch (x) { /* ignore */ } worker = null; pending = false; engine = 'main'; };
+        return (engine = 'worker');
+      } catch (e) { return (engine = 'main'); }
+    });
+  }
+
   function loop() {
     var v = $('video'), c = $('canvas'), g = c.getContext('2d', { willReadFrequently: true });
     var tick = function () {
-      if (!stream) return;
-      if (!busy && v.readyState >= 2 && v.videoWidth) {
-        // read only the middle square (where the frame is) – faster and fewer wrong reads
-        var s = Math.min(v.videoWidth, v.videoHeight), sx = (v.videoWidth - s) / 2, sy = (v.videoHeight - s) / 2, n = Math.min(640, s);
-        c.width = n; c.height = n;
-        g.drawImage(v, sx, sy, s, s, 0, 0, n, n);
-        var code = window.jsQR(g.getImageData(0, 0, n, n).data, n, n, { inversionAttempts: 'dontInvert' });
-        if (code && code.data) { deliver(code.data); return; }
+      if (!stream || busy) return;
+      timer = setTimeout(tick, READ_EVERY_MS);
+      if (pending || v.readyState < 2 || !v.videoWidth) return;
+      if (engine === 'native') {
+        pending = true;
+        detector.detect(v).then(function (codes) {
+          pending = false;
+          if (codes && codes.length && codes[0].rawValue && !busy) deliver(codes[0].rawValue);
+        }).catch(function () { pending = false; engine = worker ? 'worker' : 'main'; });
+        return;
       }
-      raf = requestAnimationFrame(tick);
+      // the middle square (where the frame is) only – smaller and faster
+      var s = Math.min(v.videoWidth, v.videoHeight), n = Math.min(SIDE, s);
+      c.width = n; c.height = n;
+      g.drawImage(v, (v.videoWidth - s) / 2, (v.videoHeight - s) / 2, s, s, 0, 0, n, n);
+      var img = g.getImageData(0, 0, n, n);
+      if (engine === 'worker' && worker) {
+        pending = true;
+        worker.postMessage({ b: img.data.buffer, w: n, h: n }, [img.data.buffer]);
+      } else if (window.jsQR) {
+        var code = window.jsQR(img.data, n, n, { inversionAttempts: 'dontInvert' });
+        if (code && code.data) deliver(code.data);
+      }
     };
-    raf = requestAnimationFrame(tick);
+    pickEngine().then(function () { clearTimeout(timer); tick(); });
   }
 
   function stop() {
     if (raf) cancelAnimationFrame(raf); raf = 0;
+    clearTimeout(timer); timer = 0; pending = false;
     if (stream) stream.getTracks().forEach(function (t) { t.stop(); });
     stream = null; track = null;
   }
@@ -193,6 +238,15 @@
     img.src = url;
   });
 
+  // ---- full screen (hides the address bar) – Android Chrome; iPhone Safari does not allow it for web pages
+  canFull = !!(document.documentElement.requestFullscreen) && window.matchMedia && matchMedia('(pointer: coarse)').matches;
+  function goFull() {
+    if (!canFull || document.fullscreenElement) return;
+    document.documentElement.requestFullscreen({ navigationUI: 'hide' }).catch(function () { /* ignore */ });
+  }
+  $('view').addEventListener('click', goFull);
+  ['photo', 'torch', 'retry'].forEach(function (id) { $(id).addEventListener('click', goFull); });
+
   $('retry').addEventListener('click', start);
   $('torch').addEventListener('click', function () {
     if (!track) return;
@@ -205,6 +259,7 @@
     if (document.hidden) stop(); else if (!busy && !stream && ret && $('retry').hidden) start();
   });
   window.addEventListener('pagehide', stop);
+  document.addEventListener('fullscreenchange', function () { if (document.fullscreenElement && stream && !busy) say('Point the camera at a QR code.'); });
 
   start();
 })();
